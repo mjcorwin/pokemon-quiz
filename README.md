@@ -20,6 +20,15 @@ Then open http://localhost:8000 in **Google Chrome**, Edge or Safari and allow t
 - **Kid / Lenient / Normal / Strict** controls how close a guess has to be. A guess is only accepted if the right Pokémon is also the closest match overall, so "Charmander" never counts for Charmeleon.
 - **Kid** is for little kids: a much lower bar, a bit of slack when another Pokémon scores slightly higher, partial speech counts sooner, and a hint appears automatically after every two wrong tries.
 
+## Two players
+
+Pick **2 players** and type both names. Before the first game each player talks for a few seconds ("say your name and your favorite Pokémon") so the game learns their voice. After that, whoever says the name first gets the point.
+
+- It tells voices apart by pitch and vocal tone. A parent and a child, or two adults, are easy. Two kids of a similar age can get mixed up now and then, and the game warns you if your voices sound very alike.
+- If a point goes to the wrong person, tap the right name in the top bar while the answer is showing. Typed guesses ask "Who got it?" and wait for a tap.
+- The voice check is skipped on the next game if the names are the same. "Redo the voice check" on the setup screen starts it over.
+- Voice ID runs entirely in the browser (`voiceid.js`). Nothing is recorded, saved or sent anywhere, and the voice models are forgotten when you close the tab.
+
 ## Where the audio goes
 
 The mic status line shows which speech engine is in use. The app prefers, in order:
@@ -31,5 +40,6 @@ The mic status line shows which speech engine is in use. The app prefers, in ord
 ## Files
 
 - `match.js`: the Pokémon list, spoken aliases and the fuzzy/sound-alike matcher (loads in Node too: `node -e "console.log(require('./match.js').judge(['pick a chew'], 25, 0.62))"`)
-- `app.js`: the game loop and speech recognition
+- `app.js`: the game loop and speech recognition. Every Pokémon, and every wrong try, gets a brand-new recognizer session so nothing heard earlier carries over.
+- `voiceid.js`: on-device speaker identification for two-player mode (pitch + MFCC features, one Gaussian per player)
 - `sprites/`: official artwork for #1–151, from [PokeAPI/sprites](https://github.com/PokeAPI/sprites)

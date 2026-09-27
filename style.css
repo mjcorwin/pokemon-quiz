@@ -84,6 +84,21 @@ kbd {
 .chip small { display: block; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85; }
 .chip b { font-size: 1.1rem; font-variant-numeric: tabular-nums; }
 
+/* Two-player: per-player score chips replace Score/Streak. Tapping one during
+   the reveal gives that round's point to that player. */
+.chip.player { display: none; border: none; color: inherit; font: inherit; max-width: 120px; }
+.chip.player small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+body.two-player .chip.player { display: block; }
+body.two-player .chip.solo { display: none; }
+.chip.player.ask { animation: ask 1s infinite; }
+.chip.player.scored { animation: scored 0.6s; background: var(--gold); color: var(--text); }
+@keyframes ask {
+  50% { box-shadow: 0 0 0 3px var(--gold); }
+}
+@keyframes scored {
+  30% { transform: scale(1.18); }
+}
+
 /* ---------- main ---------- */
 main {
   max-width: 560px;
@@ -149,6 +164,7 @@ main {
 .reveal.good { box-shadow: 0 0 0 4px var(--good), var(--shadow); }
 .reveal.bad { box-shadow: 0 0 0 4px var(--bad), var(--shadow); }
 .reveal small { font-weight: 600; color: var(--muted); margin-left: 6px; font-size: 0.6em; }
+.reveal .who { display: block; text-align: center; font-size: 0.62em; font-weight: 700; color: var(--muted); }
 
 .stage.shake { animation: shake 0.4s; }
 @keyframes shake {
@@ -289,6 +305,45 @@ legend { font-weight: 700; font-size: 0.85rem; margin-bottom: 6px; }
   border-radius: 10px;
   padding: 10px 12px;
   font-size: 0.9rem;
+}
+.small { font-size: 0.85rem; color: var(--muted); margin: 8px 0 0; }
+.names { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+.names .small, .names .link { grid-column: 1 / -1; }
+.names input {
+  min-width: 0;
+  font: inherit;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+.link {
+  justify-self: start;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--blue);
+  font-weight: 600;
+  font-size: 0.85rem;
+  text-decoration: underline;
+}
+.barlabel { margin: 12px 0 4px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.bar { height: 14px; border-radius: 999px; background: var(--bg); overflow: hidden; margin: 0 0 6px; }
+.bar > div { height: 100%; width: 0; border-radius: inherit; transition: width 0.12s; }
+.bar.level { height: 6px; }
+.bar.level > div { background: var(--muted); }
+.bar.level > div.voiced { background: var(--good); }
+.bar.progress > div { background: var(--good); }
+.row { display: flex; gap: 8px; margin-top: 10px; }
+.row button {
+  flex: 1;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 10px;
+  font-weight: 600;
 }
 .missed {
   list-style: none;

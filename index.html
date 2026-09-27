@@ -11,8 +11,10 @@
     <h1>Who's That <span>Pokémon?</span></h1>
     <div class="stats" aria-live="polite">
       <div class="chip"><small>Round</small><b id="roundStat">–</b></div>
-      <div class="chip"><small>Score</small><b id="scoreStat">0</b></div>
-      <div class="chip"><small>Streak</small><b id="streakStat">0</b></div>
+      <div class="chip solo"><small>Score</small><b id="scoreStat">0</b></div>
+      <div class="chip solo"><small>Streak</small><b id="streakStat">0</b></div>
+      <button type="button" class="chip player" id="p1Chip"><small>Player 1</small><b>0</b></button>
+      <button type="button" class="chip player" id="p2Chip"><small>Player 2</small><b>0</b></button>
     </div>
   </header>
 
@@ -54,6 +56,20 @@
         <p class="lede">Name the original 151 from their shadow. Just say it out loud — close enough counts.</p>
 
         <fieldset>
+          <legend>Players</legend>
+          <div class="seg" data-setting="players">
+            <button type="button" data-value="1">1 player</button>
+            <button type="button" data-value="2">2 players</button>
+          </div>
+          <div class="names" id="playerNames" hidden>
+            <input id="p1NameInput" maxlength="16" aria-label="Player 1 name" placeholder="Player 1" />
+            <input id="p2NameInput" maxlength="16" aria-label="Player 2 name" placeholder="Player 2" />
+            <p class="small">Before the game, each player says a few words so the game can tell your voices apart. It all stays on this computer.</p>
+            <button type="button" class="link" id="revoiceBtn" hidden>Redo the voice check</button>
+          </div>
+        </fieldset>
+
+        <fieldset>
           <legend>Show them as</legend>
           <div class="seg" data-setting="mode">
             <button type="button" data-value="silhouette">Shadow</button>
@@ -86,7 +102,24 @@
           Voice recognition isn't available in this browser (try Chrome, Edge or Safari). You can still type your guesses.
         </p>
 
+        <p class="warn" id="setupWarn" hidden></p>
+
         <button type="button" class="primary" id="startBtn">Start</button>
+      </div>
+
+      <div id="enroll" hidden>
+        <h2 id="enrollTitle">Voice check</h2>
+        <p class="lede" id="enrollPrompt"></p>
+        <p class="barlabel">Microphone</p>
+        <div class="bar level" aria-hidden="true"><div id="enrollLevel"></div></div>
+        <p class="barlabel">Voice learned</p>
+        <div class="bar progress" role="progressbar" aria-label="Voice learned"><div id="enrollProgress"></div></div>
+        <p class="small" id="enrollNote" hidden></p>
+        <button type="button" class="primary" id="enrollGo" hidden>Let’s play!</button>
+        <div class="row">
+          <button type="button" id="enrollRedo">Start over</button>
+          <button type="button" id="enrollBack">Back</button>
+        </div>
       </div>
 
       <div id="results" hidden>
@@ -103,6 +136,7 @@
   </div>
 
   <script src="match.js"></script>
+  <script src="voiceid.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
