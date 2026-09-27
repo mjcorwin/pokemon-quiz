@@ -180,14 +180,15 @@
   }
 
   // Accept when the target is at least `threshold` similar AND no other Pokémon
-  // is a strictly better match (so "Charmander" never passes for Charmeleon).
-  function judge(heardList, targetId, threshold) {
+  // is a better match by more than `margin` (0 by default, so "Charmander"
+  // never passes for Charmeleon; kid mode allows a little slack).
+  function judge(heardList, targetId, threshold, margin = 0) {
     const scores = rank(heardList);
     let bestId = 0;
     for (let id = 1; id < scores.length; id++) if (scores[id] > scores[bestId] || !bestId) bestId = id;
     const target = scores[targetId];
     return {
-      accepted: target >= threshold && target >= scores[bestId] - 1e-9,
+      accepted: target >= threshold && target >= scores[bestId] - margin - 1e-9,
       targetScore: target,
       bestId,
       bestScore: scores[bestId],

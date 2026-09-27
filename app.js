@@ -2,8 +2,15 @@
   const { POKEMON, judge, normalize } = window.PokeMatch;
   const $ = (id) => document.getElementById(id);
 
-  const THRESHOLDS = { lenient: 0.5, normal: 0.62, strict: 0.8 };
-  const INTERIM_MIN = 0.8; // partial speech must be a very clear match to count early
+  // Kid mode is very forgiving: a low bar, a little slack when another Pokémon
+  // scores slightly higher, earlier acceptance of partial speech, and free hints.
+  const RULES = {
+    kid:     { threshold: 0.4,  margin: 0.12, interimMin: 0.7, autoHintAfter: 2 },
+    lenient: { threshold: 0.5,  margin: 0,    interimMin: 0.8, autoHintAfter: 0 },
+    normal:  { threshold: 0.62, margin: 0,    interimMin: 0.8, autoHintAfter: 0 },
+    strict:  { threshold: 0.8,  margin: 0,    interimMin: 0.8, autoHintAfter: 0 },
+  };
+  const rules = () => RULES[settings.strictness] || RULES.normal;
   const REVEAL_MS = 1800;
 
   const store = {
@@ -19,7 +26,7 @@
   const game = {
     deck: [], idx: 0, current: null, phase: 'idle',
     score: 0, streak: 0, bestStreak: store.get('wtp.bestStreak', 0),
-    hintLevel: 0, hintsUsed: 0, missed: [], advanceTimer: 0,
+    hintLevel: 0, hintsUsed: 0, missed: [], advanceTimer: 0, wrongTries: 0,
   };
 
   const el = {
@@ -77,6 +84,7 @@
     const mode = settings.mode === 'mix' ? (Math.random() < 0.5 ? 'silhouette' : 'outline') : settings.mode;
     game.current = { id, mon: POKEMON[id - 1], mode };
     game.hintLevel = 0;
+    game.wrongTries = 0;
     game.phase = 'loading';
     mic.ignoreBelow = mic.lastLength; // drop any speech still in flight from last round
 
@@ -184,8 +192,8 @@
   // Returns true if the round was won.
   function tryGuess(alternatives, { final }) {
     if (game.phase !== 'guess') return false;
-    const threshold = THRESHOLDS[settings.strictness];
-    const r = judge(alternatives, game.current.id, final ? threshold : Math.max(threshold, INTERIM_MIN));
+    const { threshold, margin, interimMin, autoHintAfter } = rules();
+    const r = judge(alternatives, game.current.id, final ? threshold : Math.max(threshold, interimMin), margin);
     if (r.accepted) {
       setHeard(alternatives[0], 'good');
       reveal(true);
@@ -199,6 +207,8 @@
 
     if (r.bestScore >= 0.7) setHeard(`Not ${POKEMON[r.bestId - 1].name}…`, 'bad');
     else setHeard(`“${alternatives[0]}” — try again`, 'bad');
+    game.wrongTries++;
+    if (autoHintAfter && game.wrongTries % autoHintAfter === 0) showHint();
     el.stage.classList.remove('shake');
     void el.stage.offsetWidth; // restart the animation
     el.stage.classList.add('shake');
@@ -219,25 +229,58 @@
 
   // ---------- voice ----------
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const mic = { rec: null, wanted: false, running: false, ignoreBelow: 0, lastLength: 0 };
+  const mic = { rec: null, wanted: false, running: false, ignoreBelow: 0, lastLength: 0, engine: null };
+
+  // Where the audio goes. Preference order:
+  //   local  – the browser's on-device model (Chrome/Edge 139+ `processLocally`); nothing leaves the Mac
+  //   apple  – Safari, which uses Apple's speech recognizer instead of Google's
+  //   cloud  – Chrome's default, which streams audio to Google
+  const ENGINE_LABEL = { local: 'on-device', apple: 'Apple', cloud: 'Google cloud' };
+  const isSafari = /safari/i.test(navigator.userAgent) && !/chrome|chromium|crios|edg|opr/i.test(navigator.userAgent);
+  const LOCAL_OPTS = { langs: ['en-US'], processLocally: true };
+
+  async function pickEngine() {
+    if (typeof SR.available === 'function') {
+      try {
+        let status = await SR.available(LOCAL_OPTS);
+        if (status === 'downloadable' || status === 'downloading') {
+          micUI('Downloading on-device speech model (one time)…');
+          status = (await SR.install(LOCAL_OPTS)) ? 'available' : 'unavailable';
+        }
+        if (status === 'available') return 'local';
+      } catch { /* fall through */ }
+    }
+    return isSafari ? 'apple' : 'cloud';
+  }
 
   function micUI(status) {
     el.micBtn.setAttribute('aria-pressed', String(mic.wanted));
     el.micStatus.textContent = status;
   }
 
-  function makeRecognizer() {
+  function makeRecognizer(engine) {
     const rec = new SR();
     rec.lang = 'en-US';
     rec.continuous = true;
     rec.interimResults = true;
     rec.maxAlternatives = 5;
 
+    if (engine === 'local') {
+      rec.processLocally = true;
+      // Bias the on-device model toward Pokémon names so "pikachu" isn't heard as "pick a chew".
+      if ('phrases' in rec && typeof SpeechRecognitionPhrase === 'function') {
+        try {
+          const names = [...new Set(POKEMON.map((p) => p.name.replace(/[♀♂]/g, '')))];
+          rec.phrases = names.map((n) => new SpeechRecognitionPhrase(n, 3));
+        } catch { /* biasing is optional */ }
+      }
+    }
+
     rec.onstart = () => {
       mic.running = true;
       mic.ignoreBelow = 0;
       mic.lastLength = 0;
-      micUI('Listening… say the Pokémon’s name');
+      micUI(`Listening (${ENGINE_LABEL[engine]})… say the Pokémon’s name`);
     };
     rec.onresult = (e) => {
       mic.lastLength = e.results.length;
@@ -259,6 +302,10 @@
         micUI('Microphone blocked — allow mic access in the address bar');
       } else if (e.error === 'network') {
         micUI('Speech service unreachable (needs internet in Chrome)');
+      } else if (engine === 'local' && (e.error === 'language-not-supported' || e.error === 'phrases-not-supported')) {
+        // The on-device model couldn't be used after all; retry with the browser's default engine.
+        mic.engine = isSafari ? 'apple' : 'cloud';
+        mic.rec = null;
       }
       // 'no-speech' and 'aborted' are routine; onend restarts us.
     };
@@ -275,15 +322,16 @@
   }
 
   function safeStart() {
+    mic.rec = mic.rec || makeRecognizer(mic.engine);
     try { mic.rec.start(); } catch { /* already started */ }
   }
 
-  function startMic() {
+  async function startMic() {
     if (!SR) return;
-    mic.rec = mic.rec || makeRecognizer();
     mic.wanted = true;
     micUI('Starting mic…');
-    safeStart();
+    if (!mic.engine) mic.engine = await pickEngine();
+    if (mic.wanted && !mic.running) safeStart();
   }
 
   function stopMic() {

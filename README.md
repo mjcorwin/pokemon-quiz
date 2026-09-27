@@ -17,7 +17,16 @@ Then open http://localhost:8000 in **Google Chrome**, Edge or Safari and allow t
 
 - The mic stays on. Just say the name. "Skip", "pass" or "I don't know" gives up the round, and "hint" shows letters.
 - Keys: `Space` turns the mic on or off, `?` shows a hint, `→` skips, and typing any letter starts a typed guess.
-- **Lenient / Normal / Strict** controls how close a guess has to be. A guess is only accepted if the right Pokémon is also the closest match overall, so "Charmander" never counts for Charmeleon.
+- **Kid / Lenient / Normal / Strict** controls how close a guess has to be. A guess is only accepted if the right Pokémon is also the closest match overall, so "Charmander" never counts for Charmeleon.
+- **Kid** is for little kids: a much lower bar, a bit of slack when another Pokémon scores slightly higher, partial speech counts sooner, and a hint appears automatically after every two wrong tries.
+
+## Where the audio goes
+
+The mic status line shows which speech engine is in use. The app prefers, in order:
+
+1. **on-device**: Chrome or Edge 139+ can run speech recognition locally (`processLocally`). The first time, the browser downloads a small language pack; after that nothing leaves the machine. The app also feeds the on-device model the Pokémon names so it is biased toward hearing them.
+2. **Apple**: Safari uses Apple's recognizer rather than Google's.
+3. **Google cloud**: Chrome's default when on-device isn't available. Audio is streamed to Google.
 
 ## Files
 
