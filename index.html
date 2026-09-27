@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Who's That Pokémon?</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Who's That <span>Pokémon?</span></h1>
+    <div class="stats" aria-live="polite">
+      <div class="chip"><small>Round</small><b id="roundStat">–</b></div>
+      <div class="chip"><small>Score</small><b id="scoreStat">0</b></div>
+      <div class="chip"><small>Streak</small><b id="streakStat">0</b></div>
+    </div>
+  </header>
+
+  <main>
+    <section class="stage" id="stage">
+      <img id="mon" alt="Mystery Pokémon" draggable="false" />
+      <div class="reveal" id="reveal" aria-live="assertive"></div>
+    </section>
+
+    <p class="hint" id="hint">&nbsp;</p>
+
+    <div class="voice">
+      <button class="mic" id="micBtn" type="button" aria-pressed="false" title="Toggle microphone (Space)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+      </button>
+      <div class="heard">
+        <small id="micStatus">Mic off — tap to talk</small>
+        <div id="heard">&nbsp;</div>
+      </div>
+    </div>
+
+    <form class="typed" id="guessForm" autocomplete="off">
+      <input id="guessInput" list="names" placeholder="…or type your guess" aria-label="Your guess" />
+      <datalist id="names"></datalist>
+      <button type="submit">Guess</button>
+    </form>
+
+    <div class="actions">
+      <button type="button" id="hintBtn">Hint <kbd>?</kbd></button>
+      <button type="button" id="skipBtn">Skip <kbd>→</kbd></button>
+    </div>
+  </main>
+
+  <!-- Start / results overlay -->
+  <div class="overlay" id="overlay">
+    <div class="panel">
+      <div id="setup">
+        <h2>Who's That Pokémon?</h2>
+        <p class="lede">Name the original 151 from their shadow. Just say it out loud — close enough counts.</p>
+
+        <fieldset>
+          <legend>Show them as</legend>
+          <div class="seg" data-setting="mode">
+            <button type="button" data-value="silhouette">Shadow</button>
+            <button type="button" data-value="outline">Outline</button>
+            <button type="button" data-value="mix">Mix</button>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Rounds</legend>
+          <div class="seg" data-setting="rounds">
+            <button type="button" data-value="10">10</button>
+            <button type="button" data-value="25">25</button>
+            <button type="button" data-value="50">50</button>
+            <button type="button" data-value="151">All 151</button>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>How close is close enough?</legend>
+          <div class="seg" data-setting="strictness">
+            <button type="button" data-value="lenient">Lenient</button>
+            <button type="button" data-value="normal">Normal</button>
+            <button type="button" data-value="strict">Strict</button>
+          </div>
+        </fieldset>
+
+        <p class="warn" id="noVoice" hidden>
+          Voice recognition isn't available in this browser (try Chrome, Edge or Safari). You can still type your guesses.
+        </p>
+
+        <button type="button" class="primary" id="startBtn">Start</button>
+      </div>
+
+      <div id="results" hidden>
+        <h2>Results</h2>
+        <p class="big" id="finalScore"></p>
+        <p class="lede" id="finalDetail"></p>
+        <div id="missedWrap">
+          <h3>Ones that got away</h3>
+          <ul class="missed" id="missed"></ul>
+        </div>
+        <button type="button" class="primary" id="againBtn">Play again</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="match.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
