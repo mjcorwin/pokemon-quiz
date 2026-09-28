@@ -1,248 +1,278 @@
 // On-device "who said that?" for two-player mode.
 //
-// Nothing leaves the machine and nothing is downloaded. Every ~30 ms we look at
-// the last 2048 mic samples and, if someone is talking, turn them into a small
-// voice fingerprint: pitch plus 12 MFCC-style numbers describing vocal tone.
-// Each player gets one Gaussian model from a few seconds of speech at the start,
-// and a guess is credited to whichever model most of its frames vote for.
+// A small neural speaker-embedding model (WeSpeaker CAM++, trained on
+// VoxCeleb) turns a stretch of speech into 512 numbers that describe the
+// voice rather than the words. During the voice check we store one of these
+// "voiceprints" per player; a correct guess goes to whichever voiceprint the
+// guess sounds closest to.
 //
-// Works in the browser (window.VoiceID) and in Node (module.exports) for testing.
+// Everything runs in this browser tab with ONNX Runtime Web (WebAssembly).
+// The model and runtime are served from this folder, audio never leaves the
+// machine, and voiceprints are kept in memory only.
+//
+// The pure parts (feature extraction, resampling, voice activity, scoring)
+// also load in Node for testing: require('./voiceid.js').
 (function (root) {
-  const FRAME = 2048;
-  const N_MEL = 24;
-  const N_CEP = 12;
-  const F_LO = 80, F_HI = 7000;
-  const PITCH_LO = 70, PITCH_HI = 650;
+  const RATE = 16000; // the model's sample rate
+  const BLOCK = 160; // 10 ms of audio: the unit for voice-activity decisions
+  const MODEL_URL = 'models/speaker-campplus-fp16.onnx';
+  const ORT_DIR = 'vendor/onnxruntime-web/';
 
-  // ---------- signal helpers ----------
+  // ---------- Kaldi-compatible 80-band log-mel filterbank ----------
+  // Matches kaldi-native-fbank with dither 0 and snip_edges false, which is
+  // how the model's features were computed in training, followed by
+  // per-utterance mean normalization.
 
-  const hannCache = new Map();
-  function hann(n) {
-    let w = hannCache.get(n);
-    if (!w) {
-      w = new Float32Array(n);
-      for (let i = 0; i < n; i++) w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1));
-      hannCache.set(n, w);
+  const FRAME_LEN = 400; // 25 ms
+  const FRAME_SHIFT = 160; // 10 ms
+  const NFFT = 512;
+  const NMEL = 80;
+
+  let fbankTables = null;
+  function tables() {
+    if (fbankTables) return fbankTables;
+    const win = new Float64Array(FRAME_LEN);
+    for (let i = 0; i < FRAME_LEN; i++) win[i] = Math.pow(0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FRAME_LEN - 1)), 0.85); // "povey"
+    const mel = (f) => 1127 * Math.log(1 + f / 700);
+    const lo = mel(20), hi = mel(RATE / 2);
+    const delta = (hi - lo) / (NMEL + 1);
+    const bins = [];
+    for (let m = 0; m < NMEL; m++) {
+      const left = lo + m * delta, center = left + delta, right = center + delta;
+      const taps = [];
+      for (let k = 0; k < NFFT / 2; k++) {
+        const x = mel((k * RATE) / NFFT);
+        if (x > left && x < right) taps.push([k, x <= center ? (x - left) / (center - left) : (right - x) / (right - center)]);
+      }
+      bins.push(taps);
     }
-    return w;
+    const cos = new Float64Array(NFFT / 2), sin = new Float64Array(NFFT / 2);
+    for (let i = 0; i < NFFT / 2; i++) { cos[i] = Math.cos((-2 * Math.PI * i) / NFFT); sin[i] = Math.sin((-2 * Math.PI * i) / NFFT); }
+    const rev = new Uint16Array(NFFT);
+    for (let i = 0, bits = Math.log2(NFFT); i < NFFT; i++) {
+      let r = 0;
+      for (let b = 0; b < bits; b++) r |= ((i >> b) & 1) << (bits - 1 - b);
+      rev[i] = r;
+    }
+    return (fbankTables = { win, bins, cos, sin, rev });
   }
 
-  // In-place radix-2 FFT; returns the power spectrum (n/2 + 1 bins).
-  function powerSpectrum(x) {
-    const n = x.length;
-    const w = hann(n);
-    const re = new Float64Array(n);
-    const im = new Float64Array(n);
-    for (let i = 0; i < n; i++) re[i] = x[i] * w[i];
-    for (let i = 1, j = 0; i < n; i++) {
-      let bit = n >> 1;
-      for (; j & bit; bit >>= 1) j ^= bit;
-      j ^= bit;
-      if (i < j) { [re[i], re[j]] = [re[j], re[i]]; }
+  function fft(re, im, t) {
+    for (let i = 0; i < NFFT; i++) {
+      const j = t.rev[i];
+      if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
     }
-    for (let len = 2; len <= n; len <<= 1) {
-      const ang = (-2 * Math.PI) / len;
-      const wr = Math.cos(ang), wi = Math.sin(ang);
-      for (let i = 0; i < n; i += len) {
-        let cr = 1, ci = 0;
-        for (let k = 0; k < len / 2; k++) {
-          const a = i + k, b = a + len / 2;
-          const tr = re[b] * cr - im[b] * ci;
-          const ti = re[b] * ci + im[b] * cr;
+    for (let len = 2; len <= NFFT; len <<= 1) {
+      const half = len >> 1, step = NFFT / len;
+      for (let i = 0; i < NFFT; i += len) {
+        for (let k = 0; k < half; k++) {
+          const wr = t.cos[k * step], wi = t.sin[k * step];
+          const a = i + k, b = a + half;
+          const tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
           re[b] = re[a] - tr; im[b] = im[a] - ti;
           re[a] += tr; im[a] += ti;
-          [cr, ci] = [cr * wr - ci * wi, cr * wi + ci * wr];
         }
       }
     }
-    const p = new Float64Array(n / 2 + 1);
-    for (let i = 0; i <= n / 2; i++) p[i] = re[i] * re[i] + im[i] * im[i];
-    return p;
   }
 
-  const bankCache = new Map();
-  function melBank(n, sr) {
-    const key = n + ':' + sr;
-    let bank = bankCache.get(key);
-    if (bank) return bank;
-    const mel = (f) => 2595 * Math.log10(1 + f / 700);
-    const hz = (m) => 700 * (10 ** (m / 2595) - 1);
-    const lo = mel(F_LO), hi = mel(Math.min(F_HI, sr / 2 - 1));
-    const edges = [];
-    for (let i = 0; i < N_MEL + 2; i++) edges.push((hz(lo + ((hi - lo) * i) / (N_MEL + 1)) * n) / sr);
-    bank = [];
-    for (let m = 0; m < N_MEL; m++) {
-      const [a, b, c] = [edges[m], edges[m + 1], edges[m + 2]];
-      const taps = [];
-      for (let k = Math.max(1, Math.floor(a)); k <= Math.ceil(c) && k <= n / 2; k++) {
-        const g = k < b ? (k - a) / (b - a) : (c - k) / (c - b);
-        if (g > 0) taps.push([k, g]);
+  // samples: Float32Array at 16 kHz in [-1, 1]. Returns { data, frames } with
+  // data laid out [frames][80], ready for the model.
+  function fbank(samples) {
+    const t = tables();
+    const n = samples.length;
+    const frames = Math.floor((n + FRAME_SHIFT / 2) / FRAME_SHIFT);
+    const data = new Float32Array(frames * NMEL);
+    const w = new Float64Array(FRAME_LEN);
+    const re = new Float64Array(NFFT), im = new Float64Array(NFFT);
+    for (let f = 0; f < frames; f++) {
+      const start = f * FRAME_SHIFT + FRAME_SHIFT / 2 - FRAME_LEN / 2;
+      let mean = 0;
+      for (let j = 0; j < FRAME_LEN; j++) {
+        let s = start + j;
+        while (s < 0 || s >= n) s = s < 0 ? -s - 1 : 2 * n - 1 - s; // reflect at the edges
+        w[j] = samples[s] * 32768;
+        mean += w[j];
       }
-      bank.push(taps);
+      mean /= FRAME_LEN;
+      for (let j = 0; j < FRAME_LEN; j++) w[j] -= mean;
+      for (let j = FRAME_LEN - 1; j > 0; j--) w[j] -= 0.97 * w[j - 1];
+      w[0] -= 0.97 * w[0];
+      re.fill(0); im.fill(0);
+      for (let j = 0; j < FRAME_LEN; j++) re[j] = w[j] * t.win[j];
+      fft(re, im, t);
+      for (let m = 0; m < NMEL; m++) {
+        let e = 0;
+        for (const [k, g] of t.bins[m]) e += g * (re[k] * re[k] + im[k] * im[k]);
+        data[f * NMEL + m] = Math.log(Math.max(e, 1.1920929e-7));
+      }
     }
-    bankCache.set(key, bank);
-    return bank;
-  }
-
-  // Normalized autocorrelation pitch tracker. Returns { f0, clarity } where
-  // clarity near 1 means a clean, periodic (voiced) sound.
-  function pitch(x, sr) {
-    // Halve the rate for speed; pitch lives well below 12 kHz.
-    const n = x.length >> 1;
-    const s = sr / 2;
-    const y = new Float64Array(n);
-    let mean = 0;
-    for (let i = 0; i < n; i++) { y[i] = (x[2 * i] + x[2 * i + 1]) / 2; mean += y[i]; }
-    mean /= n;
-    const sq = new Float64Array(n + 1); // prefix sums of y^2
-    for (let i = 0; i < n; i++) { y[i] -= mean; sq[i + 1] = sq[i] + y[i] * y[i]; }
-
-    const minLag = Math.max(2, Math.floor(s / PITCH_HI));
-    const maxLag = Math.min(Math.ceil(s / PITCH_LO), Math.floor(n / 2));
-    const nr = new Float64Array(maxLag + 2);
-    let best = 0;
-    for (let l = minLag - 1; l <= maxLag + 1; l++) {
-      let r = 0;
-      for (let i = 0; i + l < n; i++) r += y[i] * y[i + l];
-      const e = Math.sqrt(sq[n - l] * (sq[n] - sq[l]));
-      nr[l] = e > 0 ? r / e : 0;
-      if (l >= minLag && l <= maxLag && nr[l] > best) best = nr[l];
-    }
-    if (best <= 0) return { f0: 0, clarity: 0 };
-    // Periodic signals score ~equally at T, 2T, 3T...; take the first strong peak.
-    let lag = 0;
-    for (let l = minLag; l <= maxLag; l++) {
-      if (nr[l] >= 0.9 * best && nr[l] >= nr[l - 1] && nr[l] >= nr[l + 1]) { lag = l; break; }
-    }
-    if (!lag) return { f0: 0, clarity: 0 };
-    const a = nr[lag - 1], b = nr[lag], c = nr[lag + 1];
-    const d = a - 2 * b + c;
-    const shift = d < 0 ? (0.5 * (a - c)) / d : 0;
-    return { f0: s / (lag + shift), clarity: b };
-  }
-
-  // One frame of mic audio -> { rms, voiced, vec }. `state` tracks the room's
-  // noise floor between calls so quiet background hum never counts as a voice.
-  function features(x, sr, state) {
-    let e = 0;
-    for (let i = 0; i < x.length; i++) e += x[i] * x[i];
-    const rms = Math.sqrt(e / x.length);
-
-    // Noise floor = the quietest frame in the last ~2 s. Speech always has
-    // little gaps, so this settles on the room level even if someone was
-    // already talking when the mic opened.
-    const hist = (state.hist = state.hist || []);
-    hist.push(rms);
-    if (hist.length > 66) hist.shift();
-    let noise = Infinity;
-    for (const v of hist) if (v < noise) noise = v;
-    state.noise = noise;
-
-    const loud = hist.length >= 5 && rms > Math.max(0.003, noise * 2.5);
-    if (!loud) return { rms, voiced: false };
-    const p = pitch(x, sr);
-    if (p.clarity < 0.5 || p.f0 < PITCH_LO || p.f0 > PITCH_HI) return { rms, voiced: false };
-
-    const power = powerSpectrum(x);
-    const bank = melBank(x.length, sr);
-    const logMel = bank.map((taps) => {
+    // Per-utterance mean normalization, as in training.
+    for (let m = 0; m < NMEL; m++) {
       let s = 0;
-      for (const [k, g] of taps) s += power[k] * g;
-      return Math.log(s + 1e-10);
-    });
-    const vec = [Math.log2(p.f0)];
-    for (let c = 1; c <= N_CEP; c++) {
-      let s = 0;
-      for (let m = 0; m < N_MEL; m++) s += logMel[m] * Math.cos((Math.PI * c * (m + 0.5)) / N_MEL);
-      vec.push(s / N_MEL);
+      for (let f = 0; f < frames; f++) s += data[f * NMEL + m];
+      s /= frames || 1;
+      for (let f = 0; f < frames; f++) data[f * NMEL + m] -= s;
     }
-    return { rms, voiced: true, f0: p.f0, vec };
+    return { data, frames };
   }
 
-  // ---------- models ----------
-
-  function stats(vecs) {
-    const d = vecs[0].length;
-    const mean = new Array(d).fill(0);
-    const v = new Array(d).fill(0);
-    for (const x of vecs) for (let i = 0; i < d; i++) mean[i] += x[i] / vecs.length;
-    for (const x of vecs) for (let i = 0; i < d; i++) v[i] += (x[i] - mean[i]) ** 2 / vecs.length;
-    return { mean, var: v };
+  // ---------- streaming resampler (mic rate -> 16 kHz) ----------
+  class Resampler {
+    constructor(inRate) {
+      this.ratio = inRate / RATE;
+      // Windowed-sinc low-pass just under 8 kHz so nothing aliases.
+      const taps = 48;
+      const fc = (0.95 * (RATE / 2)) / inRate;
+      this.h = new Float32Array(taps + 1);
+      let sum = 0;
+      for (let i = 0; i <= taps; i++) {
+        const x = i - taps / 2;
+        const sinc = x === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * x) / (Math.PI * x);
+        this.h[i] = sinc * (0.42 - 0.5 * Math.cos((2 * Math.PI * i) / taps) + 0.08 * Math.cos((4 * Math.PI * i) / taps));
+        sum += this.h[i];
+      }
+      for (let i = 0; i <= taps; i++) this.h[i] /= sum;
+      this.hist = new Float32Array(taps); // last inputs, for filter continuity
+      this.pos = 0; // next output position, in input samples relative to this chunk
+    }
+    process(input) {
+      if (this.ratio === 1) return Float32Array.from(input);
+      const H = this.h, L = H.length, hist = this.hist;
+      // Low-pass the chunk (with history), then pick samples by linear interpolation.
+      const x = new Float32Array(hist.length + input.length);
+      x.set(hist); x.set(input, hist.length);
+      const y = new Float32Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        let s = 0;
+        const base = i + hist.length - (L - 1);
+        for (let k = 0; k < L; k++) { const idx = base + k; if (idx >= 0) s += H[k] * x[idx]; }
+        y[i] = s;
+      }
+      this.hist = x.subarray(x.length - hist.length).slice();
+      const out = [];
+      let p = this.pos;
+      const last = this.prev === undefined ? y[0] : this.prev;
+      for (; p < input.length - 1 + 1e-9; p += this.ratio) {
+        const j = Math.floor(p), f = p - j;
+        const a = j < 0 ? last : y[j];
+        const b = j + 1 < y.length ? y[j + 1] : y[j];
+        out.push(a + (b - a) * f);
+      }
+      this.pos = p - input.length;
+      this.prev = y[y.length - 1];
+      return Float32Array.from(out);
+    }
   }
 
-  // sets[p] = voiced frame vectors recorded for player p.
-  function train(sets) {
-    const each = sets.map(stats);
-    // Typical within-player spread of each feature. Flooring against this (not
-    // the spread across both players) keeps a feature that cleanly splits the
-    // players, like pitch for a parent and a child, at full strength, while
-    // stopping one player's unusually steady feature from dominating.
-    const within = each[0].var.map((_, i) => each.reduce((t, s) => t + s.var[i], 0) / each.length);
-    return each.map((s) => {
-      s.var = s.var.map((v, i) => Math.max(v, 0.5 * within[i], 1e-6));
-      s.logDet = s.var.reduce((t, v) => t + Math.log(v), 0);
-      return s;
+  // ---------- voice activity ----------
+  // A 10 ms block counts as speech when it's clearly louder than the room.
+  // The room level is the quietest block of the last ~2 s, so it adapts to
+  // background noise, and a short hangover keeps soft word endings.
+  class Vad {
+    constructor() { this.hist = []; this.hang = 0; }
+    push(block) {
+      let e = 0;
+      for (let i = 0; i < block.length; i++) e += block[i] * block[i];
+      const rms = Math.sqrt(e / block.length);
+      this.hist.push(rms);
+      if (this.hist.length > 200) this.hist.shift();
+      let noise = Infinity;
+      for (const v of this.hist) if (v < noise) noise = v;
+      const loud = this.hist.length >= 10 && rms > Math.max(0.002, noise * 3);
+      if (loud) this.hang = 20;
+      else if (this.hang > 0) this.hang--;
+      return { rms, speech: loud || this.hang > 0 };
+    }
+  }
+
+  // ---------- the neural model ----------
+  const model = { session: null, loading: null };
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('could not load ' + src));
+      document.head.appendChild(s);
     });
   }
 
-  function logLik(m, x) {
-    let t = m.logDet;
-    for (let i = 0; i < x.length; i++) t += (x[i] - m.mean[i]) ** 2 / m.var[i];
-    return -0.5 * t;
+  // Safe to call early (e.g. when "2 players" is picked) to warm up.
+  function loadModel() {
+    if (!model.loading) {
+      model.loading = (async () => {
+        if (!root.ort) await loadScript(ORT_DIR + 'ort.wasm.min.js');
+        const ort = root.ort;
+        ort.env.wasm.wasmPaths = new URL(ORT_DIR, root.location.href).href;
+        ort.env.wasm.numThreads = 1; // threads need special server headers; one is plenty here
+        ort.env.logLevel = 'error';
+        model.session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['wasm'] });
+      })().catch((err) => { model.loading = null; throw err; });
+    }
+    return model.loading;
   }
 
-  // Each frame votes for its most likely player; most votes wins, total
-  // likelihood breaks ties. Returns null when there's too little speech to judge.
-  function identify(models, vecs, minFrames = 4) {
-    if (!models || vecs.length < minFrames) return null;
-    const votes = new Array(models.length).fill(0);
-    const sums = new Array(models.length).fill(0);
-    for (const x of vecs) {
-      let best = 0, bestLL = -Infinity;
-      models.forEach((m, i) => {
-        const ll = Math.max(logLik(m, x), -200); // cap outliers
-        sums[i] += ll;
-        if (ll > bestLL) { bestLL = ll; best = i; }
-      });
-      votes[best]++;
-    }
-    let player = 0;
-    for (let i = 1; i < models.length; i++) {
-      if (votes[i] > votes[player] || (votes[i] === votes[player] && sums[i] > sums[player])) player = i;
-    }
-    return { player, confidence: votes[player] / vecs.length, frames: vecs.length };
+  // 16 kHz speech -> unit-length voiceprint (Float32Array of 512).
+  async function embed(samples) {
+    await loadModel();
+    const { data, frames } = fbank(samples);
+    const ort = root.ort;
+    const out = await model.session.run({ feats: new ort.Tensor('float32', data, [1, frames, NMEL]) });
+    const v = Float32Array.from(out[model.session.outputNames[0]].data);
+    let n = 0;
+    for (const x of v) n += x * x;
+    n = Math.sqrt(n) || 1;
+    for (let i = 0; i < v.length; i++) v[i] /= n;
+    return v;
   }
 
-  // How often a frame lands on the right player when the models never saw it:
-  // train on one half of each recording, test on the other half, then swap.
-  // (Testing on the training audio is far too optimistic, because neighbouring
-  // frames of real speech are nearly identical.) Low numbers mean the two
-  // voices sound alike to this simple model.
-  function separability(sets) {
-    let right = 0, total = 0;
-    for (let fold = 0; fold < 2; fold++) {
-      const halves = sets.map((vecs) => {
-        const mid = vecs.length >> 1;
-        return fold ? [vecs.slice(mid), vecs.slice(0, mid)] : [vecs.slice(0, mid), vecs.slice(mid)];
-      });
-      const models = train(halves.map(([fit]) => fit));
-      halves.forEach(([, test], p) => {
-        for (const x of test) {
-          if (identify(models, [x], 1).player === p) right++;
-          total++;
-        }
-      });
-    }
-    return total ? right / total : 0;
+  const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+
+  // ---------- decisions ----------
+  // Calibrated on recorded speech from many different voices: when the two
+  // players score within UNSURE of each other the game asks instead of guessing,
+  // and a voice check whose SIMILAR margin is small gets a "sound alike" warning.
+  const UNSURE = 0.05;
+  const SIMILAR = 0.15;
+  const MIN_SPEECH_S = 0.3;
+
+  // Build a player's profile from their voice-check audio.
+  async function enroll(samples) {
+    const half = samples.length >> 1;
+    return {
+      print: await embed(samples),
+      halves: [await embed(samples.subarray(0, half)), await embed(samples.subarray(half))],
+    };
+  }
+
+  // How clearly the two voices differ: how much each player's two halves agree
+  // with each other, minus how much they agree with the other player.
+  function distinctness(a, b) {
+    const self = Math.min(dot(a.halves[0], a.halves[1]), dot(b.halves[0], b.halves[1]));
+    let cross = 0;
+    for (const x of a.halves) for (const y of b.halves) cross += dot(x, y) / 4;
+    return self - cross;
+  }
+  const soundAlike = (a, b) => distinctness(a, b) < SIMILAR;
+
+  // Returns { player, sure, scores } or null when there's too little speech.
+  async function identify(profiles, samples) {
+    if (!profiles || samples.length < MIN_SPEECH_S * RATE) return null;
+    const v = await embed(samples);
+    const scores = profiles.map((p) => dot(v, p.print));
+    const player = scores[1] > scores[0] ? 1 : 0;
+    return { player, sure: Math.abs(scores[1] - scores[0]) >= UNSURE, scores };
   }
 
   // ---------- live mic listener (browser only) ----------
-
+  // An AudioWorklet hands us every raw mic sample; we resample to 16 kHz, mark
+  // each 10 ms block as speech or not, and keep the last 12 s.
   class Listener {
     constructor() {
-      this.frames = []; // recent voiced frames: { t, vec }
-      this.state = {};
-      this.onFrame = null; // (features, t) => void, every frame
+      this.blocks = []; // { t, speech, samples }
+      this.onBlock = null; // ({ rms, speech, samples, t }) => void
       this.running = false;
     }
 
@@ -254,49 +284,70 @@
       const AC = root.AudioContext || root.webkitAudioContext;
       this.ctx = this.ctx || new AC();
       if (this.ctx.resume) this.ctx.resume();
-      this.starting = navigator.mediaDevices
-        .getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
-        .then((stream) => {
-          this.stream = stream;
-          this.src = this.ctx.createMediaStreamSource(stream);
-          this.an = this.ctx.createAnalyser();
-          this.an.fftSize = FRAME;
-          this.src.connect(this.an);
-          this.buf = new Float32Array(FRAME);
-          this.state = {};
-          this.timer = setInterval(() => this.tick(), 30);
-          this.running = true;
-        })
-        .finally(() => { this.starting = null; });
+      this.starting = (async () => {
+        if (!this.workletReady) {
+          await this.ctx.audioWorklet.addModule('voice-worklet.js');
+          this.workletReady = true;
+        }
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true },
+        });
+        this.stream = stream;
+        this.src = this.ctx.createMediaStreamSource(stream);
+        this.node = new AudioWorkletNode(this.ctx, 'mic-capture');
+        this.mute = this.ctx.createGain();
+        this.mute.gain.value = 0; // keeps the node running without playing the mic back
+        this.src.connect(this.node).connect(this.mute).connect(this.ctx.destination);
+        this.resampler = new Resampler(this.ctx.sampleRate);
+        this.vad = new Vad();
+        this.pending = new Float32Array(0);
+        this.blocks = [];
+        this.node.port.onmessage = (e) => this.onChunk(e.data);
+        this.running = true;
+      })().finally(() => { this.starting = null; });
       return this.starting;
     }
 
-    tick() {
-      this.an.getFloatTimeDomainData(this.buf);
-      const f = features(this.buf, this.ctx.sampleRate, this.state);
-      const t = performance.now();
-      if (f.voiced) {
-        this.frames.push({ t, vec: f.vec });
-        while (this.frames.length && this.frames[0].t < t - 15000) this.frames.shift();
+    onChunk(chunk) {
+      const now = performance.now();
+      const y = this.resampler.process(chunk);
+      const all = new Float32Array(this.pending.length + y.length);
+      all.set(this.pending); all.set(y, this.pending.length);
+      let off = 0;
+      const count = Math.floor(all.length / BLOCK);
+      for (let b = 0; b < count; b++, off += BLOCK) {
+        const samples = all.slice(off, off + BLOCK);
+        const { rms, speech } = this.vad.push(samples);
+        const t = now - ((all.length - off - BLOCK) / RATE) * 1000;
+        const block = { t, speech, samples, rms };
+        this.blocks.push(block);
+        if (this.onBlock) this.onBlock(block);
       }
-      if (this.onFrame) this.onFrame(f, t);
+      while (this.blocks.length > 1200) this.blocks.shift();
+      this.pending = all.slice(off);
     }
 
-    voicedSince(t0) {
-      return this.frames.filter((f) => f.t >= t0).map((f) => f.vec);
+    // All speech heard since time t0 (performance.now() clock), glued together.
+    speechSince(t0) {
+      const picked = this.blocks.filter((b) => b.t >= t0 && b.speech);
+      const out = new Float32Array(picked.length * BLOCK);
+      picked.forEach((b, i) => out.set(b.samples, i * BLOCK));
+      return out;
     }
 
     stop() {
-      clearInterval(this.timer);
       if (this.src) this.src.disconnect();
+      if (this.node) { this.node.port.onmessage = null; this.node.disconnect(); }
       if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
-      this.src = this.stream = null;
-      this.frames = [];
+      this.src = this.node = this.stream = null;
+      this.blocks = [];
       this.running = false;
     }
   }
 
-  const api = { FRAME, features, pitch, train, identify, separability, Listener };
+  const api = {
+    RATE, BLOCK, fbank, Resampler, Vad, loadModel, embed, enroll, identify, soundAlike, distinctness, Listener,
+  };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.VoiceID = api;
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -24,10 +24,11 @@ Then open http://localhost:8000 in **Google Chrome**, Edge or Safari and allow t
 
 Pick **2 players** and type both names. Before the first game each player talks for a few seconds ("say your name and your favorite Pokémon") so the game learns their voice. After that, whoever says the name first gets the point.
 
-- It tells voices apart by pitch and vocal tone. A parent and a child, or two adults, are easy. Two kids of a similar age can get mixed up now and then, and the game warns you if your voices sound very alike.
-- If a point goes to the wrong person, tap the right name in the top bar while the answer is showing. Typed guesses ask "Who got it?" and wait for a tap.
+- A small neural network recognizes the voices. It turns speech into a 512-number "voiceprint" that describes the voice rather than the words, and each guess goes to the closest player.
+- Parents and kids, or two adults, are told apart very reliably. Two kids of a similar age are harder. The voice check warns you if your voices sound very alike, and when the game isn't sure it asks "Who got it?" instead of guessing.
+- If a point goes to the wrong person, tap the right name in the top bar while the answer is showing. Typed guesses also ask who got it.
 - The voice check is skipped on the next game if the names are the same. "Redo the voice check" on the setup screen starts it over.
-- Voice ID runs entirely in the browser (`voiceid.js`). Nothing is recorded, saved or sent anywhere, and the voice models are forgotten when you close the tab.
+- Everything runs in the browser. The model and its runtime are in this repo, audio never leaves the computer, and voiceprints are forgotten when you close the tab. One-player mode never loads the model.
 
 ## Where the audio goes
 
@@ -41,5 +42,7 @@ The mic status line shows which speech engine is in use. The app prefers, in ord
 
 - `match.js`: the Pokémon list, spoken aliases and the fuzzy/sound-alike matcher (loads in Node too: `node -e "console.log(require('./match.js').judge(['pick a chew'], 25, 0.62))"`)
 - `app.js`: the game loop and speech recognition. Every Pokémon, and every wrong try, gets a brand-new recognizer session so nothing heard earlier carries over.
-- `voiceid.js`: on-device speaker identification for two-player mode (pitch + MFCC features, one Gaussian per player)
+- `voiceid.js`: two-player voice ID. Captures the mic with an AudioWorklet (`voice-worklet.js`), resamples to 16 kHz, computes Kaldi-style 80-band filterbank features, and runs the speaker model with ONNX Runtime Web.
+- `models/speaker-campplus-fp16.onnx`: the speaker model, [WeSpeaker](https://github.com/wenet-e2e/wespeaker) CAM++ trained on VoxCeleb, from the [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models) export, with weights stored as 16-bit floats. Licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), following the VoxCeleb dataset.
+- `vendor/onnxruntime-web/`: [ONNX Runtime Web](https://github.com/microsoft/onnxruntime) 1.30.0, WebAssembly build only, MIT licensed.
 - `sprites/`: official artwork for #1–151, from [PokeAPI/sprites](https://github.com/PokeAPI/sprites)

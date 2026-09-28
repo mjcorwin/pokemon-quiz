@@ -16,8 +16,7 @@
   const REVEAL_MS = 1800;
   const REVEAL_MS_2P = 2600; // a bit longer so a wrongly credited point can be fixed
   const WHO_WAIT_MS = 6000; // how long to wait for "who got it?" when the voice is unclear
-  const ENROLL_FRAMES = 50; // ~1.5 s of actual voiced speech per player
-  const SIMILAR_VOICES = 0.7; // separability below this gets a "may mix you up" warning
+  const ENROLL_SECONDS = 4; // seconds of actual speech each player gives the voice check
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -38,10 +37,10 @@
     players: 1, names: [], scores: [0, 0], lastAward: null, uttStart: 0,
   };
 
-  // Voice models live only in this tab. They're never saved or sent anywhere.
-  const voice = { listener: null, models: null, key: '' };
+  // Voiceprints live only in this tab. They're never saved or sent anywhere.
+  const voice = { listener: null, profiles: null, key: '' };
   const voicesKey = () => settings.names.join('\u0000');
-  const voicesReady = () => !!voice.models && voice.key === voicesKey();
+  const voicesReady = () => !!voice.profiles && voice.key === voicesKey();
 
   const el = {
     stage: $('stage'), mon: $('mon'), reveal: $('reveal'), hint: $('hint'),
@@ -58,6 +57,9 @@
   function syncPlayersUI() {
     $('playerNames').hidden = !twoPlayer();
     $('revoiceBtn').hidden = !(twoPlayer() && voicesReady());
+    // Start fetching the voice model as soon as two players is picked, so it's
+    // ready by the time the voice check needs it. One player never loads it.
+    if (twoPlayer() && VoiceID) VoiceID.loadModel().catch(() => {});
   }
 
   for (const seg of document.querySelectorAll('.seg')) {
@@ -83,7 +85,7 @@
       syncPlayersUI();
     });
   });
-  $('revoiceBtn').addEventListener('click', () => { voice.models = null; syncPlayersUI(); });
+  $('revoiceBtn').addEventListener('click', () => { voice.profiles = null; syncPlayersUI(); });
   syncPlayersUI();
 
   el.names.innerHTML = POKEMON.map((p) => `<option value="${p.name}">`).join('');
@@ -96,11 +98,15 @@
     return a;
   }
 
+  function setupWarn(msg) {
+    $('setupWarn').textContent = msg || '';
+    $('setupWarn').hidden = !msg;
+  }
+
   async function onStart() {
     if (twoPlayer()) {
-      if (!VoiceID || !navigator.mediaDevices) {
-        $('setupWarn').textContent = 'Two-player mode needs microphone access, which this browser doesn’t offer.';
-        $('setupWarn').hidden = false;
+      if (!VoiceID || !navigator.mediaDevices || !window.AudioWorkletNode) {
+        setupWarn('Two-player mode needs microphone access, which this browser doesn’t offer.');
         return;
       }
       voice.listener = voice.listener || new VoiceID.Listener();
@@ -108,11 +114,10 @@
       try {
         await starting;
       } catch {
-        $('setupWarn').textContent = 'Two-player mode needs the microphone. Allow mic access in the address bar and try again.';
-        $('setupWarn').hidden = false;
+        setupWarn('Two-player mode needs the microphone. Allow mic access in the address bar and try again.');
         return;
       }
-      $('setupWarn').hidden = true;
+      setupWarn('');
       if (!voicesReady() && !(await enrollPlayers())) {
         voice.listener.stop();
         return;
@@ -139,30 +144,57 @@
   // ---------- two-player voice check ----------
   const enroll = { cancel: null };
 
-  function enrollUI({ title, prompt, progress = 0, note = '', ready = false }) {
+  function enrollUI({ title, prompt, progress = 0, note = '', ready = false, busy = false }) {
     $('enrollTitle').textContent = title;
     $('enrollPrompt').innerHTML = prompt;
     $('enrollProgress').style.width = `${Math.round(progress * 100)}%`;
     $('enrollNote').textContent = note;
     $('enrollNote').hidden = !note;
     $('enrollGo').hidden = !ready;
-    $('enrollRedo').hidden = false;
+    $('enrollRedo').hidden = busy;
   }
 
-  // Resolves with ENROLL_FRAMES voiced frames, or rejects with 'redo' / 'back'.
-  function collectVoice(onProgress) {
+  // Lets the Start over / Back buttons interrupt any step of the voice check.
+  function cancellable(promise) {
     return new Promise((resolve, reject) => {
-      const frames = [];
+      enroll.cancel = reject;
+      promise.then(resolve, reject);
+    });
+  }
+
+  // Resolves with ENROLL_SECONDS of the player's speech (16 kHz samples), or
+  // rejects with 'redo' / 'back'. Listening only starts after a brief quiet
+  // moment, so the previous player finishing a sentence isn't learned as
+  // this player's voice.
+  function collectVoice(onProgress, onWaiting) {
+    return new Promise((resolve, reject) => {
       const lis = voice.listener;
-      lis.onFrame = (f) => {
-        $('enrollLevel').style.width = `${Math.min(100, Math.round(Math.sqrt(f.rms) * 400))}%`;
-        $('enrollLevel').classList.toggle('voiced', !!f.voiced);
-        if (!f.voiced) return;
-        frames.push(f.vec);
-        onProgress(frames.length / ENROLL_FRAMES);
-        if (frames.length >= ENROLL_FRAMES) { lis.onFrame = null; resolve(frames); }
+      const need = ENROLL_SECONDS * (VoiceID.RATE / VoiceID.BLOCK);
+      const quietNeeded = 40; // 0.4 s
+      // Only wait if someone was still talking when this turn began.
+      const talking = lis.blocks.slice(-30).some((b) => b.speech);
+      let quiet = talking ? 0 : quietNeeded;
+      let waiting = false;
+      const got = [];
+      lis.onBlock = (b) => {
+        $('enrollLevel').style.width = `${Math.min(100, Math.round(Math.sqrt(b.rms) * 400))}%`;
+        $('enrollLevel').classList.toggle('voiced', b.speech);
+        if (quiet < quietNeeded) {
+          quiet = b.speech ? 0 : quiet + 1;
+          if (b.speech && !waiting) { waiting = true; onWaiting(); }
+          return;
+        }
+        if (!b.speech) return;
+        got.push(b.samples);
+        onProgress(got.length / need);
+        if (got.length >= need) {
+          lis.onBlock = null;
+          const out = new Float32Array(got.length * VoiceID.BLOCK);
+          got.forEach((x, i) => out.set(x, i * VoiceID.BLOCK));
+          resolve(out);
+        }
       };
-      enroll.cancel = (why) => { lis.onFrame = null; reject(why); };
+      enroll.cancel = (why) => { lis.onBlock = null; reject(why); };
     });
   }
 
@@ -179,43 +211,55 @@
     el.setup.hidden = true;
     el.enroll.hidden = false;
     const names = settings.names;
+    const leave = (msg) => {
+      el.enroll.hidden = true;
+      el.setup.hidden = false;
+      setupWarn(msg);
+      return false;
+    };
+    try {
+      enrollUI({ title: 'Voice check', prompt: 'Getting the voice model ready…', busy: true });
+      await cancellable(VoiceID.loadModel());
+    } catch (why) {
+      return leave(why === 'back' || why === 'redo' ? '' : 'Couldn’t load the voice model. Reload the page and try again.');
+    }
     for (;;) {
       try {
-        const sets = [];
+        const profiles = [];
         for (let p = 0; p < 2; p++) {
+          const title = `Voice check ${p + 1} of 2`;
           const prompt = `<b>${esc(names[p])}</b>, it’s your turn! Say your name and your favorite Pokémon. Keep talking until the bar is full.`;
-          enrollUI({ title: `Voice check ${p + 1} of 2`, prompt });
-          sets.push(await collectVoice((x) => enrollUI({ title: `Voice check ${p + 1} of 2`, prompt, progress: x })));
-          enrollUI({ title: `Voice check ${p + 1} of 2`, prompt: `Got it, <b>${esc(names[p])}</b>!`, progress: 1 });
-          await pause(900);
+          enrollUI({ title, prompt });
+          const audio = await collectVoice(
+            (x) => enrollUI({ title, prompt, progress: x }),
+            () => enrollUI({ title, prompt: `${prompt}<br><small>(Waiting for a quiet moment first…)</small>` }),
+          );
+          enrollUI({ title, prompt: `Got it, <b>${esc(names[p])}</b>! Learning your voice…`, progress: 1, busy: true });
+          profiles.push(await cancellable(VoiceID.enroll(audio)));
+          await cancellable(pause(700));
         }
-        const models = VoiceID.train(sets);
-        const sep = VoiceID.separability(sets);
-        el.enroll.dataset.separability = sep.toFixed(2); // handy when debugging
-        const alike = sep < SIMILAR_VOICES;
+        const distinct = VoiceID.distinctness(profiles[0], profiles[1]);
+        el.enroll.dataset.distinctness = distinct.toFixed(2); // handy when debugging
         enrollUI({
           title: 'Ready!',
           prompt: `I know what <b>${esc(names[0])}</b> and <b>${esc(names[1])}</b> sound like. Whoever says the name first gets the point.`,
           progress: 1,
-          note: alike
-            ? 'Your voices sound a lot alike, so I may mix you up. If a point goes to the wrong person, tap the right name at the top.'
+          note: VoiceID.soundAlike(profiles[0], profiles[1])
+            ? 'Your voices sound a lot alike, so I may mix you up. When I’m not sure I’ll ask, and if a point goes to the wrong person, tap the right name at the top.'
             : 'If I ever give a point to the wrong person, tap the right name at the top.',
           ready: true,
         });
         $('enrollGo').focus();
         await waitForGo();
-        voice.models = models;
+        voice.profiles = profiles;
         voice.key = voicesKey();
         el.enroll.hidden = true;
         el.setup.hidden = false;
         syncPlayersUI();
         return true;
       } catch (why) {
-        if (why !== 'redo') {
-          el.enroll.hidden = true;
-          el.setup.hidden = false;
-          return false;
-        }
+        if (why === 'back') return leave('');
+        if (why !== 'redo') return leave('Something went wrong with the voice check. Try again.');
       }
     }
   }
@@ -223,13 +267,18 @@
   $('enrollRedo').addEventListener('click', () => enroll.cancel && enroll.cancel('redo'));
   $('enrollBack').addEventListener('click', () => enroll.cancel && enroll.cancel('back'));
 
-  // Who was talking just now? Uses the voiced audio since the last wrong guess
-  // (that was someone else's try) or the start of the round, at most 4 s back.
-  function whoSpoke() {
-    if (!voice.models || !voice.listener || !voice.listener.running) return null;
+  // Who was talking just now? Uses the speech since the last wrong guess (that
+  // was someone else's try) or the start of the round, at most 4 s back.
+  // Resolves to a player index, or null when it can't tell.
+  async function whoSpoke() {
+    if (!voice.profiles || !voice.listener || !voice.listener.running) return null;
     const since = Math.max(game.uttStart, performance.now() - 4000);
-    const r = VoiceID.identify(voice.models, voice.listener.voicedSince(since));
-    return r ? r.player : null;
+    try {
+      const r = await VoiceID.identify(voice.profiles, voice.listener.speechSince(since));
+      return r && r.sure ? r.player : null;
+    } catch {
+      return null;
+    }
   }
 
   // ---------- rounds ----------
@@ -417,7 +466,14 @@
     const r = judge(alternatives, game.current.id, final ? threshold : Math.max(threshold, interimMin), margin);
     if (r.accepted) {
       setHeard(alternatives[0], 'good');
-      reveal(true, game.players === 2 && spoken ? whoSpoke() : null);
+      if (game.players === 2 && spoken) {
+        // Work out who said it (takes a few milliseconds), then reveal.
+        game.phase = 'judging';
+        pauseRecognizer();
+        whoSpoke().then((p) => { if (game.phase === 'judging') reveal(true, p); });
+      } else {
+        reveal(true, null);
+      }
       return 'won';
     }
     if (!final) return 'pending';
